@@ -48,9 +48,10 @@
     export OLLAMA_API_KEY='123456'
     
  """
+import asyncio
 from pydantic import BaseModel, Field # used for data validation and data parsing
 from datetime import date
-from typing import Optional
+from typing import Union, Optional, Literal
 from pydantic_ai import Agent, RunContext
 from dataclasses import dataclass
 import httpx
@@ -58,110 +59,304 @@ from fastapi import FastAPI, Header, HTTPException, BackgroundTasks, Depends
 from datetime import time
 from pydantic_ai.models.ollama import OllamaModel
 from pydantic_ai.providers.ollama import OllamaProvider
+from pydantic_ai.messages import ModelRequest, ModelResponse, TextPart, ToolCallPart, ToolReturnPart, UserPromptPart
 
+import logfire
 
-
-class FlightDetails(BaseModel):
+# need a really flat structure otherwise the model struggles with the final output
+class TripDetails(BaseModel):
+    
+    destination_city: str = Field(description="The city where the meeting/event takes place.")
+    meeting_date: date = Field(description="The date of the actual meeting.")
+    arrival_date: date = Field(description="The usually a day before the actual meeting.")
+    departure_date: date = Field(description="The usually a same day as the actual meeting.")
+    
     flight_out_date: date = Field(None, description="Flight departure date.")
     flight_out_time: time = Field(description="The departure time .")
     flight_out_airport: str = Field(description="The departure airport.")
-    flight_out_flightNo: str = Field(description="Either the booking ref, or the actual flight no if known")
+    flight_out_flightNo: str = Field(description="Either the departure flight booking ref, or the actual flight no if known")
     
-    flight_return_date: date = Field(None, description="Flight departure date.")
-    flight_return_time: time = Field(description="The departure time .")
-    flight_return_airport: str = Field(description="The departure airport.")
-    flight_return_flightNo: str = Field(description="Either the booking ref, or the actual flight no if known")
-
-class TripDetails(BaseModel):
-    destination_city: str = Field(description="The city where the meeting/event takes place.")
-    meeting_date: date = Field(description="The date of the actual meeting.")
-    flights: Optional [FlightDetails] = None
+    flight_return_date: date = Field(None, description="Flight return date.")
+    flight_return_time: time = Field(description="The return time .")
+    flight_return_airport: str = Field(description="The return airport.")
+    flight_return_flightNo: str = Field(description="Either the return flight booking ref, or the actual flight no if known")
+    
     flight_booked: bool = False
     hotel_booked: bool = False
     taxi_booked: bool = False
     
+    # Failure fields if something goes wrong
+    is_failed: bool = Field(
+        default=False, 
+        description="Set to True ONLY if a tool failed or an email was sent."
+    )
+    error_message: Optional[str] = Field(
+        default=None, 
+        description="The reason why the booking failed, or details of the sent email."
+    )
+    
+AgentOutputType = TripDetails
 
+class CalendarChangeAnalysis(BaseModel):
+    action_required: Literal['rebook', 'cancel', 'ignore']
+    extracted_city: Optional[str] = None
+    extracted_date: Optional[str] = None
+    change_summary: str
+    
+
+# START HERE, I DON'T THINK THAT THE LOGIC BELOW IS HELPFUL, IS PROBABLY CONFUSING
 class MockTravelEngine:
-    """A clean, local class simulating live flight/hotel databases."""
+    """A local class simulating live flight/hotel databases."""
     
     def search_and_book_flight(self, city: str, target_date: date) -> str:
         # Business logic: Figure out the nearest airport automatically
-        airport = "LHR (London Heathrow)" if "london" in city.lower() else "GENERIC-AIRPORT"
-        return f"Confirmed: Flight to {airport} on {target_date}. Confirmation: #FL-9938"
+        airport = city #"LHR (London Heathrow)" if "london" in city.lower() else "GENERIC-AIRPORT"
+        return f"Confirmed: Flight to {airport} on {target_date}. Confirmation Flight Number: #FL-9938"
 
     def search_and_book_hotel(self, city: str, check_in: date, check_out: date) -> str:
-        return f"Confirmed: Stay in {city} from {check_in} to {check_out}. Confirmation: #HT-1102"
+        # Business logic: Figure out the check in and check out dates automatically
+        return f"Confirmed: Stay in {city} from {check_in} to {check_out}. Confirmation Hotel Booking: #HT-1102"
+    
+    def search_and_book_taxi(self, destination_city: str, arrival_date: str, departure_date: str) -> str:
+        return f"Taxi booked for {arrival_date}, we will monitor your flight details and pick up up within 15 minutes of your landing"
     
 
-# Define the type configuration for your dependencies
-class AgentDependencies:
-    def __init__(self, travel_engine: MockTravelEngine):
-        self.travel = travel_engine
+class MockEmailClient:
+    """A local class simulating an Email Client."""
+    
+    async def send(self, to_email: str, body: str) -> bool:
+        """Simulates sending an email by printing it out to the terminal logs."""
         
-import logfire
+        print(f"\n[MOCK EMAIL SENT TO: {to_email}]")
+        print(body)
+        print("-" * 40)
+        return True
+    
+# This dictionary simulates a real calendar event on Google
+mock_google_calendar_database = {
+    "event_id_123": {
+        "summary": "Project Meeting",
+        "description": "Initial text: Meeting in London on Nov 30."
+    }
+}
+
+# Define the type configuration for your dependencies
+# class AgentDependencies:
+#     def __init__(self, travel_engine: MockTravelEngine):
+#         self.travel = travel_engine
+@dataclass # this decorator will make Python write the necessary Class constructor code, where the self.xyz will be completed for each of the two values
+class AgentDependencies:
+    travel_engine: str
+    email_service: str
+        
+
 
 # 1. Configure logfire to ONLY output to the terminal console
 logfire.configure(send_to_logfire='never')
 
 # 2. Instrument Pydantic AI
 logfire.instrument_pydantic_ai()
- 
-        
-try:
-        
-    # model = OllamaModel(
-    #     'qwen3', provider=OllamaProvider(base_url='http://localhost:11434/v1')
-    # )
-    # agent = Agent(model)  
-       
-    dateOfMeeting = date(2026, 12, 1)
-    print(f"\nDate for meeting is:{dateOfMeeting}\n")
-    myTripDetails = TripDetails(destination_city="Dublin", meeting_date=dateOfMeeting)
 
-    #current_deps = MyDeps(db=live_db, api_key="sk-prod-xyz123")
-    myTravelEngine = MockTravelEngine()
-    deps = AgentDependencies(travel_engine=myTravelEngine)
-    
-    agent = Agent(
-            'ollama:Qwen2.5:latest', # small local model for structured tool tasks - need to download this one!! qwen2.5:7b
-            deps_type=AgentDependencies,
-            output_type=TripDetails,
-            system_prompt="You are a travel booking system. Your job is to book flights and hotels.",
-            retries=10
-        )
-    
-    # Register a tool that the Agent can call when it's ready to execute
-    @agent.tool
-    def execute_booking(ctx: RunContext[AgentDependencies], trip: TripDetails) -> str:
-        """
-        Executes a live booking for a trip. 
-        ONLY call this tool if you have explicitly extracted the destination and date requirements.
-        Do NOT call this tool multiple times for the same event.
-        """
-        # Automatically apply your business rules
-        arrival = ctx.deps.travel.search_and_book_flight(trip.destination_city, trip.meeting_date)
-        # hotel = ctx.deps.travel.search_and_book_hotel(trip.destination_city, trip.arrival_date, trip.departure_date)
-        # return f"{arrival} | {hotel}"
-        return f"{arrival}"        
 
-    result = agent.run_sync(
-        f"The trip details are as follows: the meeting will take place in Paris on the 1st of December. Please search for and book the appropriate trip.", 
-        deps=deps
+# 1. User manually changes description to Paris (Triggers first run)
+mock_google_calendar_database["event_id_123"]["description"] = (
+    "Hey assistant, change of plans. It is now in Paris on 2026-12-01 instead."
+)
+
+myTravelEngine = MockTravelEngine()
+myEmailClient = MockEmailClient()
+
+deps = AgentDependencies(travel_engine=myTravelEngine, email_service=myEmailClient)
+
+# =====================================================================
+# AGENT DEFINITIONS
+# =====================================================================
+
+agent = Agent(
+    'ollama:gpt-oss:20b',
+    deps_type=deps,
+    output_type=AgentOutputType, # this is only type checking, no passing of context happens here
+    system_prompt=(
+        "You are a travel booking assistant. Your job is to book travel for a given meeting date.\n\n"
+        "CRITICAL RULES:\n"
+        "1. The company office is based in London. Choose flights from London Heathrow (long haul), "
+        "London City (short flights), or London Gatwick (all others).\n"
+        "2. If you encounter any critical failures while executing 'search_and_book', you must immediately "
+        "call 'send_clarification_email' to notify 'fred@bigcompany.com'.\n"
+        "3. Once 'send_clarification_email' has been executed, you must IMMEDIATELY stop calling tools and "
+        "return a 'BookingFailure' object. Do not attempt to book anything else."
+    ),
+    retries=3
+)
+
+
+calendar_webhook_agent = Agent(
+    'ollama:qwen3.5:9B',
+    output_type=CalendarChangeAnalysis,
+    system_prompt=(
+        "You analyze calendar updates. Compare the text against context. "
+        "CRITICAL: If the description contains text showing that flights/hotels are ALREADY booked "
+        "or says 'AUTO-BOOKED BY ASSISTANT', you must set 'action_required' to 'ignore' to prevent loops."
+            ),
+    retries=2
     )
 
-    # 8. Inspect the result
-    # print(result.data) # this works with Pydantic Model outputs
-    print(result.output)
-    # Output might look like: FlightResponse(flight_name='London Flight', price=750.0, within_budget=True)
+# 1. Tool for communicating failures back to the user
+@agent.tool
+async def send_clarification_email(
+    ctx: RunContext[AgentDependencies], 
+    recipient: str, 
+    message: str
+) -> str:
+    """Sends an email to the user when details are missing or an error occurs."""
+    email_body = (
+        f"Hi there,\n\n"
+        f"I tried processing your calendar booking request, but ran into an issue:\n"
+        f"{message}\n\n"
+        f"Please update your calendar entry with further instructions (e.g., change dates, "
+        f"adjust budget, or change location) so I can try again!\n\n"
+        f"Best,\nYour AI Travel Assistant"
+    )
 
-except Exception as e:
-    print(f"In main, Error Type: {type(e).__name__}")
-    print(f"Error Message: {e}")
+    # In production, use your injected email client to dispatch the message
+    # await ctx.deps.email_service.send(to=user_email, body=email_body)
+    print(f"Outbound email sent to {recipient}:\n{email_body}")
+    return "SUCCESS: Email sent. Stop processing immediately and return a BookingFailure state."
+
+# Register a tool that the Agent can call when it's ready to execute
+# The TripDetails parameter below is passed to the agent as a standard JSON schema.
+@agent.tool
+#def search_and_book(ctx: RunContext[AgentDependencies], trip: TripDetails) -> str: The TripDetails object seems to be confusing the agent
+def search_and_book(ctx: RunContext[AgentDependencies], destination_city: str, meeting_date: str, arrival_date: str, departure_date: str) -> str:
+    """Executes a live booking for a trip.
+
+        ONLY call this tool if you have explicitly extracted the destination city and meeting date requirements.
+        Do NOT call this tool multiple times for the same event.
+
+        Args:
+            destination_city: The name of the target destination city (e.g., 'Paris').
+            meeting_date: The date of the meeting in ISO format (YYYY-MM-DD).
+            arrival_date: The date of arrival in ISO format (YYYY-MM-DD).
+            departure_date: The date of departure in ISO format (YYYY-MM-DD).
+        """
+    try:
+        # Business logic validation before execution
+        if not destination_city or not meeting_date:
+            return "CRITICAL FAILURE: Missing required destination_city or meeting_date fields."
+
+        # Execute booking components
+        arrival = ctx.deps.travel_engine.search_and_book_flight(destination_city, meeting_date)
+        hotel = ctx.deps.travel_engine.search_and_book_hotel(destination_city, arrival_date, departure_date)
+        taxi = ctx.deps.travel_engine.search_and_book_taxi(destination_city, arrival_date, departure_date)
+        
+        return f"{arrival} | {hotel} | Taxi: {taxi}"
+    
+    except Exception as e:
+        # Return the error text to Agent.
+        # The error reason tells the model why it failed so it can use that info for the email.
+        return f"CRITICAL FAILURE: Could not complete booking. Reason from system: {str(e)}"
+               
 
 
+async def handle_incoming_webhook(event_id: str):
+    
+    try:
+        # Fetch current calendar state
+        event = mock_google_calendar_database[event_id]
+        current_text = event["description"]
+        
+        print(f"\n[Webhook Alert] Calendar event '{event_id}' updated!")
+        print(f"Current Description Text: \"{current_text}\"")
+        
+        # Run the Analyzer Agent
+        analysis_result = await calendar_webhook_agent.run(f"Analyze: {current_text}")
+        analysis = analysis_result.output
+        
+        print(f"Analysis: Action={analysis.action_required}. Summary: {analysis.change_summary}")
+                
+        if analysis.action_required == 'rebook':
+            print("Triggering Booking Agent...")
+            
+            result = await agent.run(
+                f"The trip details are as follows: the meeting will take place in Paris on the 1st of December 2026. Please search for and book the appropriate trip.", 
+                deps=deps # only now does the live context get passed in
+            )
+            
+            print("Booking Agent finished...")        
+            # Inspect the result
+            structured_data = result.output
+            
+            print("\n================= AGENT EXECUTION HISTORY =================")
+
+            for index, message in enumerate(result.all_messages(), 1):
+                print(f"\n[Step {index}] ", end="")
+                
+                # 1. Handle incoming requests/instructions from the user or framework
+                if isinstance(message, ModelRequest):
+                    print("FRAMEWORK / USER REQUEST:")
+                    for part in message.parts:
+                        if isinstance(part, UserPromptPart):  # If it's a standard string prompt
+                            print(f"  Prompt: \"{part.content}\"")
+                        elif isinstance(part, ToolReturnPart): # If it's data coming back from a tool
+                            print(f"Tool '{part.tool_name}' returned: {part.content}")
+
+                # 2. Handle actions the LLM decided to take
+                elif isinstance(message, ModelResponse):
+                    print("MODEL RESPONSE:")
+                    print(structured_data.model_dump_json(indent=2))
+                    
+                    for part in message.parts:
+                        if isinstance(part, TextPart) and part.content.strip():
+                            pass
+                                    
+                        elif isinstance(part, ToolCallPart): # If the model calls a tool
+                            print(f"Called Tool: '{part.tool_name}' with args: {part.args}")
+
+            print("\n===========================================================")
+            
+                
+            # --- SIMULATE THE CALENDAR WRITE-BACK CALLBACK ---
+            print("Updating Google Calendar description with confirmation details...")
+            
+            new_description = (
+                f"{current_text}\n\n"
+                f"[AUTO-BOOKED BY ASSISTANT]\n"
+                f"Status: Confirmed to {analysis.extracted_city} on {analysis.extracted_date}\n"
+                f"Flight No: {structured_data.flight_out_flightNo} | Hotel: Booked"
+            )
+                       
+            # Save back to our mock database
+            mock_google_calendar_database[event_id]["description"] = new_description
+            print("Calendar updated successfully in Google Database.")
+            
+            # Triggering a simulated secondary webhook to test loop prevention!
+            await handle_incoming_webhook(event_id)
+            
+        else:
+            print("Loop Safely Broken: No action taken for this event update.")
+            
+    except Exception as e:
+        print(f"In handle_incoming_webhook, Error Type: {type(e).__name__}")
+        print(f"Error Message: {e}")
+        
+        
+
+async def main():
+    
+    try:    
+        await handle_incoming_webhook("event_id_123")
+    
+    except Exception as e:
+        print(f"In main, Error Type: {type(e).__name__}")
+        print(f"Error Message: {e}")
+    
 
 
-
+if __name__ == "__main__":
+    asyncio.run(main())
+    
+    
+    
 # # 1. Define the structured output the AI must return
 # class ProjectAssessment(BaseModel):
 #     project_name: str = Field(description="The name of the AI project")
